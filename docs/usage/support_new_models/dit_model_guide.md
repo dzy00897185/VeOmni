@@ -142,10 +142,13 @@ wrapper:
 - `veomni/models/diffusers/qwen_image/qwen_image_transformer/`
 - `configs/dit/qwen_image_sft.yaml`
 
-The first Qwen-Image integration supports GPU FSDP2 full-parameter training with
-`ulysses_size: 1`. Ulysses SP for Qwen-Image requires a dedicated patch for its
-dual-stream joint attention and should be added separately from the baseline
-training path.
+Qwen-Image supports GPU FSDP2 full-parameter training and Ulysses sequence
+parallelism (`ulysses_size > 1`). SP is implemented with a dedicated
+joint-attention processor (`QwenImageSPAttnProcessor`) plus a patched forward
+(`apply_veomni_qwen_image_transformer_patch`) that slices both the text and
+image streams across SP ranks and gathers the image stream back before the
+output head, mirroring the Wan/Flux pattern. `num_attention_heads` must be
+divisible by `ulysses_size`.
 
 ### Config Bridge — `to_diffuser_dict()` and `to_dict()`
 
@@ -557,7 +560,7 @@ Ulysses SP requires an AllToAll before and after the attention kernel.
 For diffusers models this is done via an **attention processor** installed with
 `attn.set_processor(...)`.
 
-### Pattern (mirrors `veomni/ops/flash_attn` registration)
+### Pattern (mirrors `veomni/ops/kernels/attention` registration)
 
 1. Implement a `your_eager_attention_forward` function — the non-flash fallback.
    It must follow the `ALL_ATTENTION_FUNCTIONS` calling convention:
@@ -566,7 +569,8 @@ For diffusers models this is done via an **attention processor** installed with
    - Output: `((B, seq, heads, head_dim), None)`.
 
 2. In `YourSPAttnProcessor.__init__`, store the implementation name and expose
-   the attributes that `flash_attention_forward` (from `veomni/ops/flash_attn`)
+   the attributes that `flash_attention_forward` (from
+   `veomni/ops/kernels/attention`)
    reads from `module`:
 
    ```python
@@ -606,7 +610,8 @@ For diffusers models this is done via an **attention processor** installed with
    ```
 
    The `veomni_flash_attention_*_with_sp` functions registered in
-   `ALL_ATTENTION_FUNCTIONS` (see `veomni/ops/flash_attn/__init__.py`) will
+   `ALL_ATTENTION_FUNCTIONS` (see
+   `veomni/ops/kernels/attention/__init__.py`) will
    select the correct FA2/FA3/FA4 kernel automatically.
 
 5. Install the processor on every attention block:

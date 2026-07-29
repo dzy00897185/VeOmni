@@ -1,5 +1,5 @@
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-03.html
-from nvcr.io/nvidia/pytorch:25.03-py3
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-11.html
+from nvcr.io/nvidia/pytorch:25.11-py3
 
 # Define environments
 ENV MAX_JOBS=16
@@ -41,7 +41,7 @@ RUN echo "Setting timezone to CST (China Standard Time)..." && \
 
 # Install apt packages.
 RUN apt-get update -y \
-    && apt-get install -y sudo ffmpeg curl wget vim \
+    && apt-get install -y sudo ffmpeg curl wget vim openssh-server \
     && apt-get clean
 
 # Add tiger user, remove default user
@@ -88,13 +88,6 @@ RUN uv sync \
     --locked \
     --all-packages \
     --extra gpu \
-    --extra audio \
-    --extra video \
-    --extra dit \
-    --extra trl \
-    --extra lora \
-    --extra fa4 \
-    --extra flash-qla \
     --dev
 
 USER root

@@ -49,6 +49,10 @@ def get_device_flops(unit="T"):
         flops = 354e12
     elif "B200" in device_name:
         flops = 2250e12
+    elif "GB300" in device_name:
+        flops = 2500e12
+    elif "B300" in device_name:
+        flops = 2250e12
     flops_unit = unit_convert(flops, unit)
     return flops_unit
 
@@ -73,6 +77,7 @@ class VeomniFlopsCounter:
             "qwen3_vl": self._estimate_qwen3_vl_flops,
             "qwen3_vl_moe": self._estimate_qwen3_vl_moe_flops,
             "deepseek_v3": self._estimate_deepseek_v3_flops,
+            "deepseek_v4": self._estimate_deepseek_v4_flops,
             "qwen3_moe": self._estimate_qwen3_moe_flops,
             "llama": self._estimate_llama_flops,
             "qwen2": self._estimate_qwen2_flops,
@@ -86,6 +91,7 @@ class VeomniFlopsCounter:
             "qwen3_5": self._estimate_qwen3_5_family_flops,
             "qwen3_5_moe": self._estimate_qwen3_5_family_flops,
             "qwen3_5_moe_text": self._estimate_qwen3_5_family_flops,
+            "gpt_oss": self._estimate_gpt_oss_flops,
         }
 
         self.config = config
@@ -180,6 +186,126 @@ class VeomniFlopsCounter:
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
         return flops_achieved
 
+    @staticmethod
+    def _compute_compressed_attention_score_sum(batch_seqlens, compress_rate, topk=None):
+        if compress_rate <= 0:
+            raise ValueError(f"Compression rate must be positive, got {compress_rate}.")
+        if topk is not None and topk <= 0:
+            raise ValueError(f"Compressed-attention top-k must be positive, got {topk}.")
+
+        score_sum = 0
+        for seqlen in batch_seqlens:
+            if topk is None:
+                quotient, remainder = divmod(seqlen, compress_rate)
+                score_sum += compress_rate * quotient * (quotient - 1) // 2
+                score_sum += quotient * (remainder + 1)
+                continue
+
+            uncapped_len = min(seqlen, topk * compress_rate - 1)
+            quotient, remainder = divmod(uncapped_len, compress_rate)
+            score_sum += compress_rate * quotient * (quotient - 1) // 2
+            score_sum += quotient * (remainder + 1)
+            score_sum += max(0, seqlen - uncapped_len) * topk
+
+        return score_sum
+
+    def _estimate_deepseek_v4_flops(self, tokens_sum, batch_seqlens, delta_time):
+        """Estimate DeepSeek-V4 training FLOPs from its dominant matrix multiplications."""
+        hidden_size = self.config.hidden_size
+        vocab_size = self.config.vocab_size
+        moe_intermediate_size = self.config.moe_intermediate_size
+        num_hidden_layers = self.config.num_hidden_layers
+        num_attention_heads = self.config.num_attention_heads
+        head_dim = self.config.head_dim
+        q_lora_rank = self.config.q_lora_rank
+        num_experts = self.config.n_routed_experts
+        experts_per_token = self.config.num_experts_per_tok
+        hc_mult = self.config.hc_mult
+        o_groups = self.config.o_groups
+        o_lora_rank = self.config.o_lora_rank
+        layer_types = self.config.layer_types
+
+        if len(layer_types) != num_hidden_layers:
+            raise ValueError(
+                f"DeepSeek-V4 attention layer count mismatch: {len(layer_types)} entries in `config.layer_types` "
+                f"for {num_hidden_layers} hidden layers."
+            )
+
+        supported_layer_types = {
+            "sliding_attention",
+            "compressed_sparse_attention",
+            "heavily_compressed_attention",
+        }
+        unsupported_layer_types = set(layer_types) - supported_layer_types
+        if unsupported_layer_types:
+            raise ValueError(f"Unsupported DeepSeek-V4 attention layer types: {sorted(unsupported_layer_types)}.")
+
+        num_csa_layers = sum(layer_type == "compressed_sparse_attention" for layer_type in layer_types)
+        num_hca_layers = sum(layer_type == "heavily_compressed_attention" for layer_type in layer_types)
+
+        # Shared-KV MQA projections plus the grouped low-rank output projection.
+        attn_linear_N = hidden_size * q_lora_rank
+        attn_linear_N += q_lora_rank * num_attention_heads * head_dim
+        attn_linear_N += hidden_size * head_dim
+        attn_linear_N += num_attention_heads * head_dim * o_lora_rank
+        attn_linear_N += o_groups * o_lora_rank * hidden_size
+
+        # Every layer computes router logits, top-k routed experts, and shared experts.
+        n_shared_experts = getattr(self.config, "n_shared_experts", 1) or 0
+        moe_router_N = hidden_size * num_experts
+        moe_expert_N = hidden_size * moe_intermediate_size * (experts_per_token + n_shared_experts) * 3
+
+        # Each decoder layer has two mHC mappings. The final HyperHead adds one more mapping.
+        mhc_mapping_N = (2 + hc_mult) * hc_mult * (hc_mult * hidden_size)
+        mhc_head_N = hc_mult * (hc_mult * hidden_size)
+
+        hca_compressor_N = 2 * hidden_size * head_dim
+        csa_compressor_N = 4 * hidden_size * head_dim
+        indexer_N = 4 * hidden_size * self.config.index_head_dim
+        indexer_N += q_lora_rank * self.config.index_n_heads * self.config.index_head_dim
+        indexer_N += hidden_size * self.config.index_n_heads
+
+        lm_head_N = self._compute_lm_head_params(hidden_size, vocab_size)
+        linear_N = (attn_linear_N + moe_router_N + moe_expert_N + 2 * mhc_mapping_N) * num_hidden_layers
+        linear_N += hca_compressor_N * num_hca_layers
+        linear_N += (csa_compressor_N + indexer_N) * num_csa_layers
+        linear_N += mhc_head_N + lm_head_N
+        linear_flops = 6 * linear_N * tokens_sum
+
+        # mHC applies two HxH residual-stream matrix multiplications per decoder layer.
+        mhc_residual_flops = 12 * hc_mult * hc_mult * hidden_size * num_hidden_layers * tokens_sum
+
+        # CSA/HCA layers keep a sliding-window branch and concatenate compressed KV, so
+        # sliding attention scores are counted for every decoder layer.
+        sliding_score_sum = self._compute_sliding_attention_score_sum(batch_seqlens, self.config.sliding_window)
+        hca_score_sum = 0
+        if num_hca_layers > 0:
+            hca_score_sum = self._compute_compressed_attention_score_sum(
+                batch_seqlens, self.config.compress_rates["heavily_compressed_attention"]
+            )
+
+        csa_index_score_sum = 0
+        csa_attention_score_sum = 0
+        if num_csa_layers > 0:
+            csa_compress_rate = self.config.compress_rates["compressed_sparse_attention"]
+            csa_index_score_sum = self._compute_compressed_attention_score_sum(batch_seqlens, csa_compress_rate)
+            csa_attention_score_sum = self._compute_compressed_attention_score_sum(
+                batch_seqlens, csa_compress_rate, topk=self.config.index_topk
+            )
+
+        attention_score_sum = sliding_score_sum * num_hidden_layers
+        attention_score_sum += hca_score_sum * num_hca_layers
+        attention_score_sum += csa_attention_score_sum * num_csa_layers
+        attention_flops = 12 * attention_score_sum * head_dim * num_attention_heads
+
+        # The Lightning Indexer only computes query-key scores; it has no value aggregation matmul.
+        indexer_flops = (
+            6 * csa_index_score_sum * self.config.index_head_dim * self.config.index_n_heads * num_csa_layers
+        )
+
+        flops_all_token = linear_flops + mhc_residual_flops + attention_flops + indexer_flops
+        return flops_all_token * (1.0 / delta_time) / 1e12
+
     def _estimate_qwen3_moe_flops(self, tokens_sum, batch_seqlens, delta_time):
         hidden_size = self.config.hidden_size
         vocab_size = self.config.vocab_size
@@ -214,6 +340,82 @@ class VeomniFlopsCounter:
         attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
 
         # all_layer & all_token fwd & bwk flops
+        flops_all_token = dense_N_flops + attn_qkv_flops
+        flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
+        return flops_achieved
+
+    @staticmethod
+    def _compute_sliding_attention_score_sum(batch_seqlens, sliding_window):
+        attention_score_sum = 0
+        for seqlen in batch_seqlens:
+            if seqlen <= sliding_window:
+                attention_score_sum += seqlen * (seqlen + 1) // 2
+            else:
+                attention_score_sum += sliding_window * (sliding_window + 1) // 2
+                attention_score_sum += (seqlen - sliding_window) * sliding_window
+        return attention_score_sum
+
+    def _estimate_gpt_oss_flops(self, tokens_sum, batch_seqlens, delta_time):
+        """
+        Estimate GPT-OSS training FLOPs.
+
+        GPT-OSS uses all-MoE layers with top-k routed experts and a mixed schedule of
+        full attention and sliding-window attention. Learnable attention sinks are
+        negligible relative to matmul FLOPs and are intentionally ignored.
+        """
+        hidden_size = self.config.hidden_size
+        vocab_size = self.config.vocab_size
+        intermediate_size = self.config.intermediate_size
+        num_hidden_layers = self.config.num_hidden_layers
+        num_key_value_heads = self.config.num_key_value_heads
+        num_attention_heads = self.config.num_attention_heads
+        num_local_experts = self.config.num_local_experts
+        num_experts_per_tok = self.config.num_experts_per_tok
+        head_dim = getattr(self.config, "head_dim", hidden_size // num_attention_heads)
+
+        q_size = num_attention_heads * head_dim
+        k_size = num_key_value_heads * head_dim
+        v_size = num_key_value_heads * head_dim
+
+        # Router + active routed experts. GPT-OSS stores gate/up in one interleaved
+        # projection, but its arithmetic is equivalent to gate_proj + up_proj + down_proj.
+        moe_gate_N = hidden_size * num_local_experts
+        moe_expertmlp_N = hidden_size * intermediate_size * num_experts_per_tok * 3
+        attn_linear_N = hidden_size * (q_size + k_size + v_size + q_size)
+        lm_head_N = self._compute_lm_head_params(hidden_size, vocab_size)
+        dense_N = (moe_gate_N + moe_expertmlp_N + attn_linear_N) * num_hidden_layers + lm_head_N
+        dense_N_flops = 6 * dense_N * tokens_sum
+
+        layer_types = getattr(self.config, "layer_types", None)
+        if layer_types is None:
+            num_full_attn_layers = num_hidden_layers
+            num_sliding_attn_layers = 0
+        else:
+            num_full_attn_layers = sum(t == "full_attention" for t in layer_types)
+            num_sliding_attn_layers = sum(t == "sliding_attention" for t in layer_types)
+            if num_full_attn_layers + num_sliding_attn_layers != num_hidden_layers:
+                raise ValueError(
+                    f"GPT-OSS attention layer count mismatch: {num_full_attn_layers} full + "
+                    f"{num_sliding_attn_layers} sliding != {num_hidden_layers} total layers. "
+                    "The config may use an unsupported entry in `config.layer_types`."
+                )
+
+        full_attn_score_sum = 0
+        for seqlen in batch_seqlens:
+            full_attn_score_sum += seqlen * seqlen
+
+        sliding_window = getattr(self.config, "sliding_window", None)
+        if num_sliding_attn_layers > 0 and sliding_window is None:
+            raise ValueError("GPT-OSS config has sliding attention layers but no `sliding_window`.")
+        sliding_attn_score_sum = (
+            self._compute_sliding_attention_score_sum(batch_seqlens, sliding_window)
+            if num_sliding_attn_layers > 0
+            else 0
+        )
+        attn_score_sum = full_attn_score_sum * num_full_attn_layers
+        attn_score_sum += sliding_attn_score_sum * num_sliding_attn_layers
+        attn_qkv_flops = 12 * attn_score_sum * head_dim * num_attention_heads
+
         flops_all_token = dense_N_flops + attn_qkv_flops
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
         return flops_achieved
