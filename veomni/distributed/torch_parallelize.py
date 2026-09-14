@@ -818,11 +818,12 @@ def build_parallelize_model(
 
         try:
             from torch.utils.checkpoint import _CheckpointFrame
+
             _CheckpointFrame.check_recomputed_tensors_match = lambda self, *a, **kw: None
             logger.info_rank0("Patched _CheckpointFrame.check_recomputed_tensors_match (disabled dtype check).")
         except (ImportError, AttributeError):
             pass
-        
+
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs=gradient_checkpointing_kwargs,
         )
@@ -831,9 +832,6 @@ def build_parallelize_model(
     # context in BaseTrainer._build_training_context (not per-module patching).
     # Pop the kwarg so it is not passed to downstream functions.
     kwargs.pop("enable_async_activation_offload", None)
-
-    if chunk_mbs_config is not None and chunk_mbs_config.enable:
-        model = apply_chunk_mbs(model, chunk_mbs_config)
 
     if parallel_state.tp_enabled:
         logger.info_rank0("Apply tensor parallel to the model.")
